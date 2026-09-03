@@ -1,13 +1,35 @@
 """Git operations service for tasktree-manager."""
 
+import os
 import re
+import shutil
 import subprocess
+import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 from .models import GitStatus, Task, Worktree
 
 # Matches the "[ahead 1, behind 2]" suffix of a porcelain branch header
 _AHEAD_BEHIND_RE = re.compile(r"\[(?:ahead (\d+))?(?:, )?(?:behind (\d+))?\]")
+
+# Control characters (incl. ESC) that must never reach the terminal from a
+# filename or git message: a crafted name could otherwise emit OSC/CSI
+# sequences (clipboard writes, screen clears) through the status panel
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+# Hash of git's empty tree: the diff base for a repo without commits
+_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+
+def sanitize_text(text: str) -> str:
+    """Replace control characters with a visible escape (``\\x1b``)."""
+    return _CONTROL_CHARS_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
+class GitCommandError(RuntimeError):
+    """A git command failed, timed out or could not be started."""
 
 
 class GitOps:
@@ -15,9 +37,70 @@ class GitOps:
 
     # Timeout for local-only git commands (status, rev-parse) in seconds
     LOCAL_TIMEOUT = 5
-    # Timeout for commands that may hit the network (push/pull/fetch).
-    # Overridden at app startup from the [git] timeout config setting.
+    # Timeout for commands that may hit the network (push/pull/fetch) and
+    # for long local work (diffs over big trees). Overridden at app startup
+    # from the [git] timeout config setting.
     network_timeout: int = 30
+
+    # Child processes currently running, so the app can terminate them on
+    # exit: Textual thread workers run on asyncio's default executor, which
+    # asyncio.run() joins at shutdown, so a git fetch still in flight would
+    # otherwise keep the process alive after the terminal is restored
+    _live_procs: set = set()
+    _procs_lock = threading.Lock()
+
+    @staticmethod
+    def run(
+        cmd: list[str],
+        cwd,
+        timeout: float,
+        *,
+        env: dict | None = None,
+    ) -> subprocess.CompletedProcess:
+        """Run a command with a timeout, tracking it for terminate_all().
+
+        Behaves like subprocess.run(capture_output=True, text=True): the
+        child is killed on timeout and TimeoutExpired is re-raised. stdin is
+        /dev/null and GIT_TERMINAL_PROMPT=0 so git never waits for a
+        credential prompt inside a worker thread.
+        """
+        full_env = dict(os.environ)
+        full_env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        if env:
+            full_env.update(env)
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            env=full_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+        )
+        with GitOps._procs_lock:
+            GitOps._live_procs.add(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+        finally:
+            with GitOps._procs_lock:
+                GitOps._live_procs.discard(proc)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+    @staticmethod
+    def terminate_all() -> None:
+        """Terminate every tracked child process (called on app exit)."""
+        with GitOps._procs_lock:
+            procs = list(GitOps._live_procs)
+        for proc in procs:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
 
     @staticmethod
     def get_status(worktree: Worktree) -> GitStatus:
@@ -26,7 +109,8 @@ class GitOps:
         Uses a single `git status --porcelain --branch -z` call to read the
         branch name, ahead/behind counts and changed files at once. The -z
         format is NUL-separated and unquoted, so exotic filenames (quotes,
-        spaces, newlines) come through verbatim.
+        spaces, newlines) come through verbatim; control characters are
+        escaped before they can reach a widget.
         """
         status = GitStatus()
 
@@ -34,27 +118,28 @@ class GitOps:
             return status
 
         try:
-            result = subprocess.run(
+            result = GitOps.run(
                 ["git", "status", "--porcelain", "--branch", "-z"],
                 cwd=worktree.path,
-                capture_output=True,
-                text=True,
                 timeout=GitOps.LOCAL_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
             status.error = "Git status timed out"
             return status
-        except (subprocess.SubprocessError, OSError) as e:
+        except (subprocess.SubprocessError, OSError, ValueError) as e:
             status.error = f"Git status error: {e}"
             return status
 
         if result.returncode != 0:
-            status.error = f"Git status failed: {result.stderr.strip() or 'unknown error'}"
+            detail = sanitize_text(result.stderr.strip()) or "unknown error"
+            status.error = f"Git status failed: {detail}"
             return status
 
         # Rename/copy entries are followed by the original path as an
         # extra NUL-separated token, hence the manual index walk
-        tokens = result.stdout.split("\0")
+        # Split on the NUL separators FIRST; sanitizing escapes control
+        # characters (NUL included), which must only happen per token
+        tokens = [sanitize_text(token) for token in result.stdout.split("\0")]
         index = 0
         while index < len(tokens):
             token = tokens[index]
@@ -114,22 +199,27 @@ class GitOps:
 
     @staticmethod
     def update_worktree_status(worktree: Worktree) -> GitStatus:
-        """Update a worktree's status fields and return the full status."""
+        """Update a worktree's status fields and return the full status.
+
+        A failed or timed-out status leaves the worktree's last known
+        branch/dirty state in place: the default GitStatus looks clean, and
+        rendering a dirty worktree with a green check on a transient
+        timeout would be wrong.
+        """
         status = GitOps.get_status(worktree)
-        worktree.branch = status.branch
-        worktree.is_dirty = status.is_dirty
-        worktree.changed_files = status.changed_files
+        if not status.error:
+            worktree.branch = status.branch
+            worktree.is_dirty = status.is_dirty
+            worktree.changed_files = status.changed_files
         return status
 
     @staticmethod
     def push(worktree: Worktree) -> tuple[bool, str]:
         """Push changes in a worktree."""
         try:
-            result = subprocess.run(
+            result = GitOps.run(
                 ["git", "push", "-u", "origin", "HEAD"],
                 cwd=worktree.path,
-                capture_output=True,
-                text=True,
                 timeout=GitOps.network_timeout,
             )
             if result.returncode == 0:
@@ -144,11 +234,9 @@ class GitOps:
     def pull(worktree: Worktree) -> tuple[bool, str]:
         """Pull changes in a worktree."""
         try:
-            result = subprocess.run(
+            result = GitOps.run(
                 ["git", "pull"],
                 cwd=worktree.path,
-                capture_output=True,
-                text=True,
                 timeout=GitOps.network_timeout,
             )
             if result.returncode == 0:
@@ -160,66 +248,99 @@ class GitOps:
             return False, str(e)
 
     @staticmethod
-    def _git_stdout(worktree: Worktree, args: list[str]) -> str:
+    def _git_stdout(
+        worktree: Worktree,
+        args: list[str],
+        *,
+        check: bool = False,
+        timeout: float | None = None,
+        env: dict | None = None,
+    ) -> str:
         """Run a local read-only git command in the worktree, returning stdout.
 
-        Returns "" on any failure. The exit code is intentionally ignored:
-        ``git diff --no-index`` returns non-zero whenever files differ, and a
-        failed command leaves stdout empty anyway. errors="replace" keeps
+        With ``check=False`` (probes such as rev-parse --verify) any failure
+        yields "". With ``check=True`` a timeout, a non-zero exit or a
+        missing git raise GitCommandError: the archive helpers use this so a
+        diff that could not be produced never masquerades as "nothing to
+        archive" right before a branch is deleted. errors="replace" keeps
         non-UTF-8 diff content (e.g. latin-1 sources) from raising
         UnicodeDecodeError mid-archive.
         """
+        cmd = ["git", *args]
         try:
-            result = subprocess.run(
-                ["git", *args],
+            result = GitOps.run(
+                cmd,
                 cwd=worktree.path,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=GitOps.LOCAL_TIMEOUT,
+                timeout=timeout if timeout is not None else GitOps.LOCAL_TIMEOUT,
+                env=env,
             )
-        except (subprocess.SubprocessError, OSError):
+        except (subprocess.SubprocessError, OSError) as e:
+            if check:
+                raise GitCommandError(f"{' '.join(cmd)}: {e}") from e
             return ""
+        if check and result.returncode != 0:
+            raise GitCommandError(f"{' '.join(cmd)}: {result.stderr.strip() or 'failed'}")
         return result.stdout
-
-    @staticmethod
-    def _list_untracked(worktree: Worktree) -> list[str]:
-        """List untracked (but not ignored) files in a worktree."""
-        out = GitOps._git_stdout(worktree, ["ls-files", "--others", "--exclude-standard", "-z"])
-        return [f for f in out.split("\0") if f]
 
     @staticmethod
     def get_worktree_diff(worktree: Worktree, label: str | None = None) -> str:
         """Return a unified diff of all uncommitted changes in a worktree.
 
-        Combines staged and unstaged tracked changes (``git diff HEAD``) with
-        untracked files, so the result mirrors what a working-tree review shows.
-        When *label* is given, every file path is prefixed with ``<label>/`` so
-        diffs from several repos can be concatenated into one view without
-        colliding on identical relative paths.
+        Covers staged, unstaged and untracked changes relative to HEAD (the
+        empty tree for a repo without commits) in ONE git invocation: the
+        real index is copied to a temporary file, everything is ``git add
+        -A``-ed into that copy, and ``git diff --cached`` is taken against
+        HEAD. The worktree's own index is never touched. ``--binary`` keeps
+        binary changes applyable. When *label* is given, every file path is
+        prefixed with ``<label>/`` so diffs from several repos can be
+        concatenated into one view without colliding on identical paths.
 
         Returns an empty string when the worktree is clean or missing.
+        Raises GitCommandError when the diff cannot be produced.
         """
         if not worktree.path.exists():
             return ""
 
         # Without a label, git's default a/ b/ prefixes are used.
         prefixes = [f"--src-prefix=a/{label}/", f"--dst-prefix=b/{label}/"] if label else []
-        parts: list[str] = []
+        timeout = GitOps.network_timeout
 
-        # Tracked changes (staged + unstaged) relative to HEAD.
-        parts.append(GitOps._git_stdout(worktree, ["diff", "HEAD", "--no-color", *prefixes]))
+        index_path = GitOps._git_stdout(
+            worktree, ["rev-parse", "--git-path", "index"], check=True
+        ).strip()
+        real_index = Path(index_path)
+        if not real_index.is_absolute():
+            real_index = worktree.path / real_index
+        head = (
+            "HEAD"
+            if GitOps._git_stdout(worktree, ["rev-parse", "--verify", "--quiet", "HEAD"])
+            else _EMPTY_TREE
+        )
 
-        # Untracked files, rendered as additions against /dev/null.
-        for untracked in GitOps._list_untracked(worktree):
-            parts.append(
-                GitOps._git_stdout(
-                    worktree,
-                    ["diff", "--no-index", "--no-color", *prefixes, "--", "/dev/null", untracked],
-                )
+        fd, tmp_index = tempfile.mkstemp(prefix="tasktree-index-")
+        os.close(fd)
+        try:
+            if real_index.exists():
+                shutil.copyfile(real_index, tmp_index)
+            else:
+                os.unlink(tmp_index)  # let git create a fresh index
+            env = {"GIT_INDEX_FILE": tmp_index}
+            GitOps._git_stdout(
+                worktree, ["add", "-A", "--", "."], check=True, timeout=timeout, env=env
             )
-
-        return "".join(parts)
+            return GitOps._git_stdout(
+                worktree,
+                ["diff", "--cached", "--binary", "--no-color", *prefixes, head],
+                check=True,
+                timeout=timeout,
+                env=env,
+            )
+        finally:
+            for leftover in (tmp_index, tmp_index + ".lock"):
+                try:
+                    os.unlink(leftover)
+                except OSError:
+                    pass
 
     @staticmethod
     def get_task_base(worktree: Worktree, branch: str) -> str | None:
@@ -233,19 +354,29 @@ class GitOps:
         return out.strip() or None
 
     @staticmethod
-    def get_branch_diff(worktree: Worktree, base_branch: str, label: str | None = None) -> str:
-        """Return the diff of committed-but-unmerged work: base...HEAD.
+    def get_branch_diff(
+        worktree: Worktree, base_branch: str, label: str | None = None, ref: str = "HEAD"
+    ) -> str:
+        """Return the diff of committed-but-unmerged work: base...<ref>.
 
         Uses the three-dot form (changes since the merge base), preferring
-        ``origin/<base>`` and falling back to the local base branch. No fetch
-        is performed — archives need completeness of *our* work, not remote
-        freshness. Returns "" when no base ref resolves or nothing differs.
+        ``origin/<base>`` and falling back to the local base branch, then to
+        any ref the name resolves to. No fetch is performed — archives need
+        completeness of *our* work, not remote freshness. ``ref`` names the
+        branch whose work is archived (default HEAD); when it does not
+        resolve, HEAD is used. ``--binary`` keeps binary changes applyable.
+        Returns "" when no base ref resolves or nothing differs. Raises
+        GitCommandError when the diff itself fails.
         """
         if not worktree.path.exists():
             return ""
 
         base_ref = None
-        for candidate in (f"refs/remotes/origin/{base_branch}", f"refs/heads/{base_branch}"):
+        for candidate in (
+            f"refs/remotes/origin/{base_branch}",
+            f"refs/heads/{base_branch}",
+            f"{base_branch}^{{commit}}",
+        ):
             probe = GitOps._git_stdout(worktree, ["rev-parse", "--verify", "--quiet", candidate])
             if probe.strip():
                 base_ref = candidate
@@ -253,8 +384,21 @@ class GitOps:
         if base_ref is None:
             return ""
 
+        head_ref = "HEAD"
+        if ref != "HEAD":
+            probe = GitOps._git_stdout(
+                worktree, ["rev-parse", "--verify", "--quiet", f"refs/heads/{ref}"]
+            )
+            if probe.strip():
+                head_ref = f"refs/heads/{ref}"
+
         prefixes = [f"--src-prefix=a/{label}/", f"--dst-prefix=b/{label}/"] if label else []
-        return GitOps._git_stdout(worktree, ["diff", f"{base_ref}...HEAD", "--no-color", *prefixes])
+        return GitOps._git_stdout(
+            worktree,
+            ["diff", "--binary", "--no-color", *prefixes, f"{base_ref}...{head_ref}"],
+            check=True,
+            timeout=GitOps.network_timeout,
+        )
 
     @staticmethod
     def build_task_diff(task: Task) -> str:
@@ -327,18 +471,16 @@ class GitOps:
         try:
             if fetch:
                 # Fetch latest remote refs so we detect merges done via GitLab/GitHub UI
-                subprocess.run(
+                GitOps.run(
                     ["git", "fetch", "origin", base_branch],
                     cwd=worktree.path,
-                    capture_output=True,
                     timeout=GitOps.network_timeout,
                 )
             # Use git merge-base --is-ancestor to check if HEAD is reachable from base
             # This checks if the current branch has been merged
-            result = subprocess.run(
+            result = GitOps.run(
                 ["git", "merge-base", "--is-ancestor", "HEAD", f"origin/{base_branch}"],
                 cwd=worktree.path,
-                capture_output=True,
                 timeout=GitOps.LOCAL_TIMEOUT,
             )
             # Exit code 0 means HEAD is an ancestor of base (merged)

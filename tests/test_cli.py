@@ -162,7 +162,9 @@ class TestDelete:
         monkeypatch.setattr(
             forge,
             "get_forge_status",
-            lambda path, branch: ForgeStatus(provider="gitlab", mr_state="merged", mr_ref="!42"),
+            lambda path, branch, max_age=None: ForgeStatus(
+                provider="gitlab", mr_state="merged", mr_ref="!42"
+            ),
         )
         capsys.readouterr()
         assert cli(config, "delete", "TASK-squash") == 0
@@ -254,7 +256,9 @@ class TestFinish:
         monkeypatch.setattr(
             forge,
             "get_forge_status",
-            lambda path, branch: ForgeStatus(provider="gitlab", mr_state="merged", mr_ref="!1"),
+            lambda path, branch, max_age=None: ForgeStatus(
+                provider="gitlab", mr_state="merged", mr_ref="!1"
+            ),
         )
         capsys.readouterr()
         assert cli(config, "finish", "task-x", "--push") == 0
@@ -285,7 +289,9 @@ class TestFinish:
         monkeypatch.setattr(
             forge,
             "get_forge_status",
-            lambda path, branch: ForgeStatus(provider="gitlab", mr_state="merged", mr_ref="!42"),
+            lambda path, branch, max_age=None: ForgeStatus(
+                provider="gitlab", mr_state="merged", mr_ref="!42"
+            ),
         )
         capsys.readouterr()
         assert cli(config, "finish", "TASK-squash", "--push") == 0
@@ -382,7 +388,7 @@ class TestStatus:
         monkeypatch.setattr(
             forge_module,
             "get_forge_status",
-            lambda path, branch: ForgeStatus(
+            lambda path, branch, max_age=None: ForgeStatus(
                 provider="gitlab",
                 mr_state="merged",
                 mr_url="https://gitlab.example.com/g/p/-/merge_requests/42",

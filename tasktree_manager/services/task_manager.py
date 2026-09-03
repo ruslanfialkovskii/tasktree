@@ -10,46 +10,68 @@ from datetime import datetime
 from pathlib import Path
 
 from . import forge
-from .claude_hooks import ensure_worktree_claude_settings
+from .claude_hooks import ensure_worktree_claude_settings, exclude_from_git
 from .config import Config
 from .models import RepoIssue, Task, TaskSafetyReport, Worktree
 
-# Task name validation pattern
-TASK_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._/\-]+$")
+# Task name validation pattern. No '/': a task is exactly one directory
+# level under TASKS_DIR (list_tasks() only reads that level), and a slashed
+# name would be surfaced as its parent directory with the wrong branch name.
+TASK_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9._\-]+$")
 
 
 def validate_task_name(name: str) -> str | None:
     """Validate a task name, returning an error message or None if valid.
 
-    Task names become directory paths under TASKS_DIR and git branch names,
-    so they must not traverse outside the tasks directory ('..', '.' or
-    empty path segments) or look like a git option (leading '-').
+    Task names become a directory under TASKS_DIR and a git branch name, so
+    they must be a single path segment that cannot traverse ('.', '..') or
+    look like a git option (leading '-').
     """
     if not name:
         return "Task name cannot be empty"
     if name.startswith("-"):
         return "Task name cannot start with '-'"
     if not TASK_NAME_PATTERN.match(name):
-        return "Task name can only contain letters, numbers, '.', '_', '/', '-'"
-    parts = name.split("/")
-    if "" in parts:
-        return "Task name cannot have empty path segments"
-    if any(part in (".", "..") for part in parts):
-        return "Task name cannot contain '.' or '..' path segments"
+        return "Task name can only contain letters, numbers, '.', '_', '-'"
+    if name in (".", ".."):
+        return "Task name cannot be '.' or '..'"
     return None
+
+
+# Characters git itself forbids in ref names, plus ':' (which would turn the
+# `git fetch origin <base>` argument into a src:dst refspec that overwrites a
+# local branch) and control characters.
+_BRANCH_FORBIDDEN = re.compile(r"[\s~^:?*\[\\\x00-\x1f\x7f]|\.\.|@\{")
 
 
 def validate_branch_name(branch: str) -> str | None:
     """Validate a base branch name, returning an error message or None.
 
-    Branch names are passed as positional git arguments; a leading '-'
-    would be parsed as a git option (e.g. --upload-pack=<command>).
+    Branch names are passed as positional git arguments: a leading '-' would
+    be parsed as a git option (e.g. --upload-pack=<command>), and a refspec
+    such as '+refs/heads/main:refs/heads/develop' would make the fetch
+    force-move the local 'develop' branch before failing.
     """
     if not branch:
         return "Branch name cannot be empty"
-    if branch.startswith("-"):
-        return "Branch name cannot start with '-'"
+    if branch.startswith(("-", "+")):
+        return "Branch name cannot start with '-' or '+'"
+    if _BRANCH_FORBIDDEN.search(branch) or branch.endswith(("/", ".lock", ".")):
+        return "Branch name contains characters git does not allow"
     return None
+
+
+def normalize_base_branch(branch: str) -> str:
+    """Strip ref prefixes so 'origin/main' and 'refs/heads/main' mean 'main'.
+
+    The base is fetched as ``origin/<base>`` and recorded in branch config;
+    a remote-qualified spelling would be recorded verbatim and later resolve
+    to nothing when the archive looks for refs/remotes/origin/origin/main.
+    """
+    for prefix in ("refs/remotes/origin/", "refs/heads/", "origin/"):
+        if branch.startswith(prefix) and len(branch) > len(prefix):
+            return branch[len(prefix) :]
+    return branch
 
 
 class TaskManager:
@@ -97,29 +119,33 @@ class TaskManager:
             return worktrees
 
         for dirpath, dirnames, filenames in os.walk(task.path):
+            # A worktree has a .git file (or a .git directory for a plain
+            # clone dropped into the task); test before pruning, which
+            # removes ".git" from dirnames
+            has_git = ".git" in dirnames or ".git" in filenames
             # Prune ignored directories in-place
             dirnames[:] = [d for d in dirnames if d not in self.IGNORED_PATHS]
 
-            # Check if this directory has .git (file or directory)
-            if ".git" in dirnames or ".git" in filenames:
+            if has_git:
                 worktree_path = Path(dirpath)
-                # Don't descend into .git directories
-                if ".git" in dirnames:
-                    dirnames[:] = [d for d in dirnames if d != ".git"]
-
-                try:
-                    rel_path = worktree_path.relative_to(task.path)
-                    # Skip the task root itself if it has .git
-                    if str(rel_path) == ".":
-                        continue
+                rel_path = worktree_path.relative_to(task.path)
+                # Skip the task root itself if it has .git
+                if str(rel_path) != ".":
                     worktrees.append(Worktree(name=str(rel_path), path=worktree_path))
-                except ValueError:
-                    continue
+                # A worktree's own tree can hold thousands of directories
+                # (and nested repos are not worktrees): stop descending
+                dirnames[:] = []
 
         return sorted(worktrees, key=lambda w: w.name)
 
     def get_task(self, name: str) -> Task | None:
-        """Get a specific task by name."""
+        """Get a specific task by name.
+
+        Raises ValueError for names that are not valid task names: callers
+        (the CLI in particular) go on to rmtree the returned path, so '',
+        '.', '..' or an absolute path must never resolve to a Task.
+        """
+        self._validate_task_name(name)
         task_path = self.config.tasks_dir / name
         if not task_path.exists():
             return None
@@ -134,21 +160,41 @@ class TaskManager:
         self._validate_task_name(name)
 
         task_path = self.config.tasks_dir / name
+        created_dir = not task_path.exists()
         task_path.mkdir(parents=True, exist_ok=True)
 
         task = Task(name=name, path=task_path)
 
-        for repo_name in repos:
-            self._create_worktree(task, repo_name, base_branch)
+        try:
+            for repo_name in repos:
+                self._create_worktree(task, repo_name, base_branch)
+        except BaseException:
+            # A half-created task (a bad base branch in repo #2, a fetch
+            # timeout) must not linger as a ghost: it shows up in the list
+            # with no repos and blocks a retry with "task already exists"
+            if created_dir:
+                self._rollback_task(task)
+            raise
 
         task.worktrees = self._get_worktrees(task)
         return task
 
+    def _rollback_task(self, task: Task) -> None:
+        """Best-effort removal of a task this call created but could not finish."""
+        try:
+            for worktree in self._get_worktrees(task):
+                self._remove_worktree(worktree, task.name)
+        finally:
+            shutil.rmtree(task.path, ignore_errors=True)
+
     def _create_worktree(self, task: Task, repo_name: str, base_branch: str) -> None:
         """Create a worktree for a repo within a task."""
+        from .git_ops import GitOps
+
         error = validate_branch_name(base_branch)
         if error:
             raise ValueError(error)
+        base_branch = normalize_base_branch(base_branch)
 
         repo_path = self.config.repos_dir / repo_name
         worktree_path = task.path / repo_name
@@ -162,6 +208,11 @@ class TaskManager:
         # Ensure parent directory exists for nested repos
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # A worktree directory deleted by hand leaves git's registration
+        # behind, and `worktree add` then refuses with "already used by
+        # worktree"; nothing else in the app would ever prune it
+        self._run_cleanup_git(["git", "worktree", "prune"], cwd=repo_path, timeout=10)
+
         # Check if branch already exists
         branch_check = subprocess.run(
             ["git", "rev-parse", "--verify", f"refs/heads/{task.name}"],
@@ -169,55 +220,58 @@ class TaskManager:
             capture_output=True,
             timeout=10,
         )
+        branch_exists = branch_check.returncode == 0
 
-        # Use -B to reset branch if it exists, -b if it doesn't
-        branch_flag = "-B" if branch_check.returncode == 0 else "-b"
-
-        # Fetch the base branch and base the worktree on the remote-tracking
-        # ref directly. The local base branch is not trustworthy: the main
-        # checkout may sit on another branch or be behind origin, and pulling
-        # it (the old approach) silently did nothing in those cases, creating
-        # worktrees from stale code. Falls back to the local branch when the
-        # fetch fails (offline, or a repo without an "origin" remote).
         network_timeout = self.config.git_timeout
-        fetch = subprocess.run(
-            ["git", "fetch", "origin", base_branch],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=network_timeout,
-        )
+        if branch_exists:
+            # Reuse the branch as it is. Resetting it to the base (-B) would
+            # silently orphan every commit that only exists on that branch,
+            # e.g. a task recreated after its branch was left behind.
+            add_cmd = ["git", "worktree", "add", str(worktree_path), task.name]
+        else:
+            # Fetch the base branch and base the worktree on the remote-tracking
+            # ref directly. The local base branch is not trustworthy: the main
+            # checkout may sit on another branch or be behind origin, and pulling
+            # it (the old approach) silently did nothing in those cases, creating
+            # worktrees from stale code. Falls back to the local branch when the
+            # fetch fails or hangs (offline, or a repo without an "origin" remote).
+            fetch_ok = False
+            try:
+                fetch = GitOps.run(
+                    ["git", "fetch", "origin", base_branch],
+                    cwd=repo_path,
+                    timeout=network_timeout,
+                )
+                fetch_ok = fetch.returncode == 0
+            except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
+                fetch_ok = False
 
-        start_point = base_branch
-        if fetch.returncode == 0:
-            remote_ref = subprocess.run(
-                ["git", "rev-parse", "--verify", f"refs/remotes/origin/{base_branch}"],
-                cwd=repo_path,
-                capture_output=True,
-                timeout=10,
-            )
-            if remote_ref.returncode == 0:
-                start_point = f"origin/{base_branch}"
+            start_point = base_branch
+            if fetch_ok:
+                remote_ref = subprocess.run(
+                    ["git", "rev-parse", "--verify", f"refs/remotes/origin/{base_branch}"],
+                    cwd=repo_path,
+                    capture_output=True,
+                    timeout=10,
+                )
+                if remote_ref.returncode == 0:
+                    start_point = f"origin/{base_branch}"
 
-        # Create git worktree with task name as branch. --no-track keeps the
-        # task branch from tracking origin/<base>; push sets its own upstream
-        # (git push -u origin HEAD).
-        result = subprocess.run(
-            [
+            # Create git worktree with task name as branch. --no-track keeps the
+            # task branch from tracking origin/<base>; push sets its own upstream
+            # (git push -u origin HEAD).
+            add_cmd = [
                 "git",
                 "worktree",
                 "add",
                 "--no-track",
-                branch_flag,
+                "-b",
                 task.name,
                 str(worktree_path),
                 start_point,
-            ],
-            cwd=repo_path,
-            capture_output=True,
-            text=True,
-            timeout=network_timeout,
-        )
+            ]
+
+        result = GitOps.run(add_cmd, cwd=repo_path, timeout=network_timeout)
 
         if result.returncode != 0:
             error_msg = result.stderr.strip() or result.stdout.strip()
@@ -374,7 +428,10 @@ class TaskManager:
         for worktree in task.worktrees:
             if not worktree.path.exists():
                 continue
-            branch = worktree.branch or task.name
+            # Archive the task branch, not whatever HEAD happens to be:
+            # finish_task deletes refs/heads/<task>, so a detached or
+            # switched worktree must not hide that branch's commits
+            branch = task.name
             # Prefer the base recorded at creation — diffing a --base
             # release/1.0 task against the repo default would bloat the
             # archive or, with no default ref resolvable, silently drop
@@ -382,7 +439,9 @@ class TaskManager:
             base_branch = GitOps.get_task_base(worktree, branch) or GitOps.get_default_branch(
                 worktree
             )
-            branch_diff = GitOps.get_branch_diff(worktree, base_branch, label=worktree.name)
+            branch_diff = GitOps.get_branch_diff(
+                worktree, base_branch, label=worktree.name, ref=branch
+            )
             uncommitted_diff = GitOps.get_worktree_diff(worktree, label=worktree.name)
             header.append(f"# repo: {worktree.name} branch: {branch} base: {base_branch}")
             sections.append(branch_diff)
@@ -528,6 +587,25 @@ class TaskManager:
                 )
                 return issues
 
+            # Every verdict below (ahead count, merge-base) is about HEAD,
+            # while deletion removes refs/heads/<task>. A detached or
+            # switched worktree would therefore read as clean/merged even
+            # when the task branch holds unpushed commits: block instead.
+            if status.branch != task.name:
+                checked_out = status.branch or "detached HEAD"
+                issues.append(
+                    RepoIssue(
+                        repo_name=worktree.name,
+                        worktree_path=worktree.path,
+                        issue_type="error",
+                        details=(
+                            f"checked out '{checked_out}', not task branch '{task.name}'"
+                            " (switch back before deleting)"
+                        ),
+                    )
+                )
+                return issues
+
             # Check for uncommitted changes
             if status.is_dirty:
                 issues.append(
@@ -549,12 +627,19 @@ class TaskManager:
                     )
                 )
 
-            default_branch = GitOps.get_default_branch(worktree)
+            # Judge "merged" against the base the task was branched from
+            # (recorded at creation), not the repo default: a release/1.0
+            # task merged into origin/release/1.0 is done
+            default_branch = GitOps.get_task_base(worktree, task.name) or GitOps.get_default_branch(
+                worktree
+            )
             if not GitOps.check_merged(worktree, default_branch):
                 # Squash/rebase merges are invisible to the ancestor check;
-                # ask the forge (glab/gh) before flagging the branch unmerged
+                # ask the forge (glab/gh) before flagging the branch unmerged.
+                # max_age=0 bypasses the badge cache: this verdict gates a
+                # destructive action, so an MR merged a moment ago must count
                 branch = status.branch or task.name
-                forge_status = forge.get_forge_status(worktree.path, branch)
+                forge_status = forge.get_forge_status(worktree.path, branch, max_age=0)
                 if forge_status is not None and forge_status.mr_state == "merged":
                     ref = forge_status.mr_ref or "MR"
                     issues.append(
@@ -714,6 +799,7 @@ class TaskManager:
             return
 
         content: str | None = None
+        from_commit = False
         try:
             head = subprocess.run(
                 ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
@@ -732,6 +818,7 @@ class TaskManager:
                 )
                 if show.returncode == 0:
                     content = show.stdout
+                    from_commit = True
         except (OSError, subprocess.SubprocessError):
             pass
 
@@ -742,3 +829,10 @@ class TaskManager:
 
         if content:
             (worktree.path / "CLAUDE.md").write_text(content)
+            if from_commit:
+                # The copy is untracked on this branch and would mark the
+                # worktree dirty (blocking deletion) for a file tasktree
+                # itself wrote. The repo already tracks CLAUDE.md on its
+                # default branch, so excluding the untracked copy repo-wide
+                # hides nothing a user would want to commit.
+                exclude_from_git(repo_path, "CLAUDE.md")

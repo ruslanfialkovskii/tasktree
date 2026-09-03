@@ -1,7 +1,22 @@
 """Claude Code hook configuration for status monitoring."""
 
 import json
+import os
+from datetime import datetime
 from pathlib import Path
+
+
+def claude_config_dir() -> Path:
+    """Claude Code's config home: $CLAUDE_CONFIG_DIR, else ~/.claude.
+
+    Transcripts (projects/<encoded-path>/*.jsonl) and per-project memory
+    live under it, so every lookup must honour the override or a user who
+    relocated their config gets no session resume and diverging memory.
+    """
+    override = os.environ.get("CLAUDE_CONFIG_DIR")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".claude"
 
 
 def _encode_project_path(folder: Path) -> str:
@@ -15,9 +30,9 @@ def _encode_project_path(folder: Path) -> str:
 def has_claude_session(folder: Path) -> bool:
     """Return True if Claude Code has a recorded session for the given folder.
 
-    Claude CLI stores transcripts at ~/.claude/projects/<encoded-path>/*.jsonl.
+    Claude CLI stores transcripts at <config dir>/projects/<encoded-path>/*.jsonl.
     """
-    project_dir = Path.home() / ".claude" / "projects" / _encode_project_path(folder)
+    project_dir = claude_config_dir() / "projects" / _encode_project_path(folder)
     if not project_dir.is_dir():
         return False
     return any(project_dir.glob("*.jsonl"))
@@ -31,7 +46,7 @@ def repo_memory_dir(repo_path: Path) -> Path:
     and the main checkout itself — one shared memory that outlives any
     single worktree.
     """
-    return Path.home() / ".claude" / "projects" / _encode_project_path(repo_path) / "memory"
+    return claude_config_dir() / "projects" / _encode_project_path(repo_path) / "memory"
 
 
 def _make_hook(status: str, status_file: str) -> dict:
@@ -55,13 +70,26 @@ def _build_hooks_config(status_file: str) -> dict:
 
 
 def _load_settings(settings_file: Path) -> dict:
-    """Read existing settings JSON, tolerating a missing or corrupt file."""
-    if settings_file.exists():
+    """Read existing settings JSON, tolerating a missing or corrupt file.
+
+    A file that does not parse is moved aside to ``<name>.broken-<ts>``
+    rather than silently overwritten: settings.local.json also holds the
+    user's permissions.allow/deny and hooks, which would otherwise be lost.
+    """
+    if not settings_file.exists():
+        return {}
+    try:
+        data = json.loads(settings_file.read_text())
+    except OSError:
+        return {}
+    except json.JSONDecodeError:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         try:
-            return json.loads(settings_file.read_text())
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+            settings_file.rename(settings_file.with_name(f"{settings_file.name}.broken-{stamp}"))
+        except OSError:
+            pass
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _is_tasktree_hook_group(group: object) -> bool:
@@ -128,26 +156,25 @@ def ensure_claude_hooks(task_path: Path, memory_dir: str = "") -> None:
     settings_file.write_text(json.dumps(existing, indent=2) + "\n")
 
 
-def _exclude_settings_from_git(repo_path: Path) -> None:
-    """Hide .claude/settings.local.json from git status in the repo.
+def exclude_from_git(repo_path: Path, entry: str) -> None:
+    """Add a pattern to <repo>/.git/info/exclude (shared with its worktrees).
 
-    Appends the path to <repo>/.git/info/exclude, which worktrees share
-    with the main checkout, so the generated settings file never shows
-    up as an untracked change in any of them.
+    Idempotent. A file without a trailing newline gets one first so the new
+    entry is never glued onto the user's last pattern.
     """
     git_dir = repo_path / ".git"
     if not git_dir.is_dir():
         return
 
-    entry = ".claude/settings.local.json"
     exclude_file = git_dir / "info" / "exclude"
     try:
-        existing = exclude_file.read_text().splitlines() if exclude_file.exists() else []
-        if entry in existing:
+        existing = exclude_file.read_text() if exclude_file.exists() else ""
+        if entry in existing.splitlines():
             return
         exclude_file.parent.mkdir(parents=True, exist_ok=True)
+        prefix = "" if not existing or existing.endswith("\n") else "\n"
         with exclude_file.open("a") as f:
-            f.write(entry + "\n")
+            f.write(prefix + entry + "\n")
     except OSError:
         return
 
@@ -175,4 +202,5 @@ def ensure_worktree_claude_settings(
     existing["autoMemoryDirectory"] = str(repo_memory_dir(repo_path))
 
     settings_file.write_text(json.dumps(existing, indent=2) + "\n")
-    _exclude_settings_from_git(repo_path)
+    # Hide the generated file from git status in the repo and its worktrees
+    exclude_from_git(repo_path, ".claude/settings.local.json")

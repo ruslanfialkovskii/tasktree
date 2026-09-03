@@ -150,15 +150,11 @@ def _run_forge_command(cmd: list[str], cwd: Path) -> str | None:
     stdin=DEVNULL is essential: an unauthenticated glab/gh may prompt
     interactively, which would hang the calling worker thread.
     """
+    from .git_ops import GitOps
+
     try:
-        result = subprocess.run(
-            cmd,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=Forge.FORGE_TIMEOUT,
-        )
+        # GitOps.run tracks the child so app exit can terminate a hung gh/glab
+        result = GitOps.run(cmd, cwd=cwd, timeout=Forge.FORGE_TIMEOUT)
     except (subprocess.TimeoutExpired, subprocess.SubprocessError, OSError):
         return None
     if result.returncode != 0:
@@ -329,8 +325,13 @@ def _fetch_status(worktree_path: Path, branch: str) -> ForgeStatus | None:
     return _parse_gh_payload(payload) if payload is not None else None
 
 
-def get_forge_status(worktree_path: Path, branch: str) -> ForgeStatus | None:
+def get_forge_status(
+    worktree_path: Path, branch: str, max_age: float | None = None
+) -> ForgeStatus | None:
     """MR/PR state for a worktree's branch, TTL-cached; None = unknown.
+
+    ``max_age`` caps how old a cached entry may be (default CACHE_TTL);
+    pass 0 to force a live lookup, as the delete safety check does.
 
     Thread-safe: called concurrently from the safety-check ThreadPoolExecutor
     and TUI poll workers. Two concurrent misses on the same key may fetch
@@ -338,10 +339,11 @@ def get_forge_status(worktree_path: Path, branch: str) -> ForgeStatus | None:
     """
     if not Forge.enabled or not branch:
         return None
+    ttl = Forge.CACHE_TTL if max_age is None else max_age
     key = (str(worktree_path), branch)
     with _lock:
         cached = _cache.get(key)
-        if cached is not None and time.monotonic() - cached[0] < Forge.CACHE_TTL:
+        if cached is not None and time.monotonic() - cached[0] < ttl:
             return cached[1]
     result = _fetch_status(worktree_path, branch)
     with _lock:

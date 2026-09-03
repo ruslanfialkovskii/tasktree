@@ -13,7 +13,7 @@ from pathlib import Path
 
 from . import __version__
 from .services import forge
-from .services.config import Config
+from .services.config import Config, ConfigError
 from .services.git_ops import GitOps
 from .services.models import Task
 from .services.task_manager import TaskManager
@@ -196,6 +196,11 @@ def cmd_delete(manager: TaskManager, config: Config, args: argparse.Namespace) -
         print("use --force to delete anyway", file=sys.stderr)
         return 1
 
+    # Same safety net as the TUI: the remaining diff is archived before the
+    # worktrees and branches are removed, --force included
+    archive_path = manager.archive_task(task)
+    if archive_path is not None:
+        print(f"Archived diff to {archive_path}")
     manager.finish_task(task)
     print(f"Deleted task {args.name}")
     return 0
@@ -415,7 +420,10 @@ def run_cli(argv: list[str], config: Config | None = None) -> int:
     """Parse argv and run the matching subcommand, returning an exit code."""
     args = build_parser().parse_args(argv)
     if config is None:
-        config = Config.load()
+        try:
+            config = Config.load()
+        except ConfigError as e:
+            return _error(str(e))
     config.ensure_dirs()
     GitOps.network_timeout = config.git_timeout
     forge.Forge.configure(config)

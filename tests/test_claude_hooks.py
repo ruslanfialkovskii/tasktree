@@ -78,7 +78,8 @@ class TestEnsureClaudeHooks:
         assert settings["autoMemoryDirectory"] == "/new/memory"
 
     def test_recovers_from_corrupt_settings(self, tmp_path):
-        """Test that invalid JSON in existing settings is replaced, not fatal."""
+        """Invalid JSON is moved aside (it may hold the user's permissions),
+        then a fresh settings file is written."""
         claude_dir = tmp_path / ".claude"
         claude_dir.mkdir()
         settings_file = claude_dir / "settings.local.json"
@@ -89,6 +90,9 @@ class TestEnsureClaudeHooks:
         settings = json.loads(settings_file.read_text())
         assert "hooks" in settings
         assert "autoMemoryDirectory" in settings
+        backups = list(claude_dir.glob("settings.local.json.broken-*"))
+        assert len(backups) == 1
+        assert backups[0].read_text() == "{not json"
 
     def test_preserves_user_hooks(self, tmp_path):
         """User-written hook groups survive: settings.local.json holds

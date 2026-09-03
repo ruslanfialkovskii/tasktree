@@ -100,16 +100,41 @@ class TestTaskNameValidation:
 
     @pytest.mark.parametrize(
         "name",
-        ["..", "../evil", "../../repos/x", "a/../b", "a/./b", "/absolute", "a//b", "trailing/"],
+        [
+            ".",
+            "..",
+            "../evil",
+            "../../repos/x",
+            "a/../b",
+            "a/./b",
+            "/absolute",
+            "a//b",
+            "trailing/",
+        ],
     )
     def test_rejects_traversal_names(self, task_manager, name):
-        """Names with '..', '.' or empty path segments must be rejected.
+        """Names with '..', '.' or any path separator must be rejected.
 
         A task path is rmtree'd on finish, so '..' would delete outside
         TASKS_DIR.
         """
         with pytest.raises(ValueError):
             task_manager.create_task(name, [], "main")
+
+    @pytest.mark.parametrize("name", ["feat/x", "team/DIC-1813"])
+    def test_rejects_slash_names(self, task_manager, name):
+        """A task is one directory level: list_tasks() would surface 'feat/x'
+        as task 'feat' with the wrong branch name, and deleting that would
+        leave the real branches behind."""
+        with pytest.raises(ValueError, match="can only contain"):
+            task_manager.create_task(name, [], "main")
+
+    @pytest.mark.parametrize("name", ["", ".", "..", "../evil", "/absolute", "feat/x"])
+    def test_get_task_rejects_unsafe_names(self, task_manager, name):
+        """get_task() feeds CLI delete/finish, which rmtree the returned path:
+        '' and '.' would resolve to TASKS_DIR itself, '..' to its parent."""
+        with pytest.raises(ValueError):
+            task_manager.get_task(name)
 
     def test_rejects_leading_dash(self, task_manager):
         """Names starting with '-' (git-option lookalikes) are rejected."""
@@ -122,9 +147,9 @@ class TestTaskNameValidation:
             task_manager.create_task("bad name[1]", [], "main")
 
     def test_accepts_normal_names(self, task_manager, sample_repo):
-        """Ordinary ticket-style names still work, including subdirectories."""
+        """Ordinary ticket-style names still work."""
         _, branch = sample_repo
-        task = task_manager.create_task("team/DIC-1813.hotfix", ["sample-repo"], branch)
+        task = task_manager.create_task("DIC-1813.hotfix_v2", ["sample-repo"], branch)
         assert task.path.exists()
 
 
@@ -396,7 +421,7 @@ class TestStatusErrorSafety:
             GitOps, "get_status", staticmethod(lambda wt: GitStatus(error="Git status timed out"))
         )
 
-        def forge_must_not_run(path, br):
+        def forge_must_not_run(path, br, max_age=None):
             raise AssertionError("forge must not be consulted when git status failed")
 
         monkeypatch.setattr(forge, "get_forge_status", forge_must_not_run)
@@ -486,7 +511,7 @@ class TestForgeAwareSafety:
         monkeypatch.setattr(
             forge,
             "get_forge_status",
-            lambda path, branch: ForgeStatus(
+            lambda path, branch, max_age=None: ForgeStatus(
                 provider="gitlab",
                 mr_state="merged",
                 mr_url="https://gitlab.example.com/g/p/-/merge_requests/42",
@@ -522,7 +547,7 @@ class TestForgeAwareSafety:
         monkeypatch.setattr(
             forge,
             "get_forge_status",
-            lambda path, branch: ForgeStatus(
+            lambda path, branch, max_age=None: ForgeStatus(
                 provider="gitlab",
                 mr_state="open",
                 mr_url="https://gitlab.example.com/g/p/-/merge_requests/7",
@@ -579,16 +604,31 @@ class TestArchiveTask:
         archive_dir = config.get_archive_dir()
         assert not archive_dir.exists() or not list(archive_dir.iterdir())
 
-    def test_archive_slash_task_name_sanitized(self, config, task_manager, repo_with_origin):
+    def test_archive_uses_task_branch_not_head(self, config, task_manager, repo_with_origin):
+        """A detached worktree must still archive the task branch's commits.
+
+        finish_task deletes refs/heads/<task>; if the archive followed HEAD
+        instead, switching the worktree away from the task branch would
+        silently drop those commits from the safety net.
+        """
         base = repo_with_origin
-        task = task_manager.create_task("feat/slashed", ["repo-remote"], base)
+        task = task_manager.create_task("ARCHIVE-HEAD", ["repo-remote"], base)
         wt = task.worktrees[0]
-        (wt.path / "x.txt").write_text("x\n")
+        (wt.path / "committed.txt").write_text("work\n")
+        subprocess.run(["git", "add", "."], cwd=wt.path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "task work"], cwd=wt.path, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "checkout", "-q", "--detach", f"origin/{base}"],
+            cwd=wt.path,
+            check=True,
+            capture_output=True,
+        )
 
         archive_path = task_manager.archive_task(task)
         assert archive_path is not None
-        assert "/" not in archive_path.name.replace(archive_path.suffix, "")
-        assert archive_path.name.startswith("feat-slashed-")
+        assert "committed.txt" in archive_path.read_text()
 
     def test_list_tasks_ignores_archive_dir(self, config, task_manager, repo_with_origin):
         base = repo_with_origin
@@ -654,13 +694,31 @@ class TestTaskManagerEdgeCases:
         """Test creating task when branch already exists."""
         repo_path, branch = sample_repo
 
-        # Create task to make the branch
-        task1 = task_manager.create_task("BRANCH-TEST", ["sample-repo"], branch)
-        task_manager.finish_task(task1)
+        # Leave a branch with its own commit behind (as if a task was
+        # removed by hand, or the branch was created outside tasktree)
+        subprocess.run(
+            ["git", "branch", "BRANCH-TEST", branch], cwd=repo_path, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "checkout", "-q", "BRANCH-TEST"], cwd=repo_path, check=True, capture_output=True
+        )
+        (repo_path / "kept.txt").write_text("keep me\n")
+        subprocess.run(["git", "add", "."], cwd=repo_path, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "prior work"],
+            cwd=repo_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-q", branch], cwd=repo_path, check=True, capture_output=True
+        )
 
-        # Create again - should use -B to reset
-        task2 = task_manager.create_task("BRANCH-TEST", ["sample-repo"], branch)
-        assert task2.name == "BRANCH-TEST"
+        # Creating the task reuses the branch as-is instead of resetting it
+        # to the base (-B), which would orphan the prior commit
+        task = task_manager.create_task("BRANCH-TEST", ["sample-repo"], branch)
+        assert task.name == "BRANCH-TEST"
+        assert (task.worktrees[0].path / "kept.txt").exists()
 
     def test_add_existing_repo_to_task(self, task_manager, sample_repos):
         """Test adding a repo that already exists in task."""
