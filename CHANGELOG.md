@@ -15,6 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Git hooks support
 - Custom task metadata
 
+## [2.12.1] - 2026-09-03
+
+### Changed
+- Align guides with deletion, config and platform behaviour
+- **release**: Gate tag on lint and tests, derive version from tags
+
+### Fixed
+- **tui**: Install configured keybindings, safe worktree delete, markup-safe rows
+- **config**: Keep env overrides out of config.toml and fail on bad TOML
+- **services**: Harden task deletion, creation and archive safety
+
+
 ## [2.12.0] - 2026-07-31
 
 ### Added
