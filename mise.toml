@@ -69,17 +69,20 @@ description = "Run tasktree-manager in dev mode with textual console"
 run = "textual run --dev tasktree_manager.app:TaskTreeApp"
 
 [tasks."release:check"]
-description = "Dry-run to preview what a release would do"
+description = "Dry-run to preview what a patch release would do"
 run = "python scripts/bump_version.py patch --dry-run"
 
+# Releases are cut by the Release workflow (tests gate the tag). Bumping
+# pyproject locally desyncs it from the latest tag and makes the workflow
+# skip or double-bump, so these tasks dispatch the workflow instead.
 [tasks."release:patch"]
-description = "Bump patch version locally"
-run = "python scripts/bump_version.py patch"
+description = "Trigger a patch release via GitHub Actions"
+run = "gh workflow run release.yml -f release_type=patch"
 
 [tasks."release:minor"]
-description = "Bump minor version locally"
-run = "python scripts/bump_version.py minor"
+description = "Trigger a minor release via GitHub Actions"
+run = "gh workflow run release.yml -f release_type=minor"
 
 [tasks."release:major"]
-description = "Bump major version locally"
-run = "python scripts/bump_version.py major"
+description = "Trigger a major release via GitHub Actions"
+run = "gh workflow run release.yml -f release_type=major"

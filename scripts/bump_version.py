@@ -22,8 +22,16 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Bump version for tasktree-manager")
     parser.add_argument(
         "bump_type",
+        nargs="?",
         choices=["patch", "minor", "major"],
-        help="The type of version bump to perform",
+        help="The type of version bump to perform (omit when using --set)",
+    )
+    parser.add_argument(
+        "--set",
+        dest="set_version",
+        metavar="X.Y.Z",
+        help="Write this exact version instead of bumping (used by the release "
+        "workflow, which takes the version from semantic-release)",
     )
     parser.add_argument(
         "--dry-run",
@@ -106,7 +114,9 @@ def update_pyproject_version(current_version: str, new_version: str, dry_run: bo
         elif stripped.startswith("[") and in_section:
             in_section = False
 
-        if in_section and re.match(r'^version\s*=\s*"' + re.escape(current_version) + '"', stripped):
+        if in_section and re.match(
+            r'^version\s*=\s*"' + re.escape(current_version) + '"', stripped
+        ):
             line = line.replace(f'"{current_version}"', f'"{new_version}"')
             changed = True
 
@@ -135,7 +145,9 @@ def get_changelog_from_commits() -> str:
     try:
         result = subprocess.run(
             ["git", "describe", "--tags", "--abbrev=0"],
-            capture_output=True, text=True, cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
         )
         last_tag = result.stdout.strip() if result.returncode == 0 else ""
     except Exception:
@@ -148,7 +160,10 @@ def get_changelog_from_commits() -> str:
 
     try:
         result = subprocess.run(
-            git_log_cmd, capture_output=True, text=True, cwd=PROJECT_ROOT,
+            git_log_cmd,
+            capture_output=True,
+            text=True,
+            cwd=PROJECT_ROOT,
         )
         commits = result.stdout.strip().splitlines() if result.returncode == 0 else []
     except Exception:
@@ -262,7 +277,11 @@ def update_changelog(new_version: str, message: str = "", dry_run: bool = False)
                 while insert_idx < len(lines) and lines[insert_idx].strip() == "":
                     insert_idx += 1
                 # Skip description lines
-                while insert_idx < len(lines) and lines[insert_idx].strip() and not lines[insert_idx].startswith("##"):
+                while (
+                    insert_idx < len(lines)
+                    and lines[insert_idx].strip()
+                    and not lines[insert_idx].startswith("##")
+                ):
                     insert_idx += 1
                 while insert_idx < len(lines) and lines[insert_idx].strip() == "":
                     insert_idx += 1
@@ -288,7 +307,9 @@ def commit_changes(new_version: str, push: bool = False, create_tag: bool = Fals
             cwd=PROJECT_ROOT,
         )
 
-        subprocess.run(["git", "add", "pyproject.toml", "CHANGELOG.md"], check=True, cwd=PROJECT_ROOT)
+        subprocess.run(
+            ["git", "add", "pyproject.toml", "CHANGELOG.md"], check=True, cwd=PROJECT_ROOT
+        )
 
         commit_message = f"chore(release): bump version to {new_version}"
         subprocess.run(["git", "commit", "-m", commit_message], check=True, cwd=PROJECT_ROOT)
@@ -330,7 +351,14 @@ def main():
 
     try:
         current_version = get_current_version()
-        new_version = calculate_new_version(current_version, args.bump_type)
+        if args.set_version:
+            if not re.fullmatch(r"\d+\.\d+\.\d+", args.set_version):
+                raise ValueError(f"--set expects X.Y.Z, got {args.set_version!r}")
+            new_version = args.set_version
+        elif args.bump_type:
+            new_version = calculate_new_version(current_version, args.bump_type)
+        else:
+            raise ValueError("either a bump type (patch/minor/major) or --set X.Y.Z is required")
 
         print(f"Current version: {current_version}")
         print(f"New version: {new_version}")
@@ -357,7 +385,9 @@ def main():
         else:
             print("\nNext steps:")
             print(f"1. Edit CHANGELOG.md to document changes in version {new_version}")
-            print(f"2. Commit changes: git commit -am 'chore(release): bump version to {new_version}'")
+            print(
+                f"2. Commit changes: git commit -am 'chore(release): bump version to {new_version}'"
+            )
             print(f"3. Create tag: git tag -a v{new_version} -m 'Release v{new_version}'")
             print("4. Push changes: git push origin HEAD && git push origin --tags")
 

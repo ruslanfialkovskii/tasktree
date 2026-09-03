@@ -4,9 +4,16 @@
 # Handles version bumping, testing, building, PyPI publishing,
 # and GitHub release creation.
 #
+# Order matters: the version is only *computed* up front; lint and the full
+# test matrix run against the pushed commit, and only when they pass is the
+# bump committed, tagged and pushed. A red release run therefore never
+# leaves a ghost tag or a bumped pyproject on main.
+#
 # Triggers:
 #   - Push to main: semantic-release determines if a release is needed
-#   - Manual dispatch: choose release type, pre-release, and draft options
+#   - Manual dispatch: choose release type, pre-release, and draft options.
+#     Both `draft` and `pre_release` skip the PyPI upload (the pipeline can
+#     only produce final X.Y.Z versions) and only shape the GitHub release.
 
 name: Release
 
@@ -26,12 +33,12 @@ on:
           - minor
           - major
       pre_release:
-        description: "Mark as pre-release?"
+        description: "Mark the GitHub release as pre-release? (skips PyPI)"
         required: false
         default: false
         type: boolean
       draft:
-        description: "Create as draft release?"
+        description: "Create the GitHub release as a draft? (skips PyPI)"
         required: false
         default: false
         type: boolean
@@ -49,7 +56,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -57,84 +63,79 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install python-semantic-release build hatch-vcs
+        # Pinned: an unpinned resolver pull once produced a PSR/GitPython
+        # combination that crashed on startup
+        run: pip install "python-semantic-release==10.6.2"
 
       - name: Determine version
         id: determine_version
         env:
-          GH_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Get current version from pyproject.toml
-          current_version=$(python -c "
-          import re
-          content = open('pyproject.toml').read()
-          match = re.search(r'^\s*version\s*=\s*\"([^\"]+)\"', content, re.MULTILINE)
-          print(match.group(1) if match else '0.0.0')
-          ")
+          # The latest v* tag is the source of truth for the current version
+          # (semantic-release derives the next one from it). pyproject is
+          # only reported: a stray local bump must not shift the release.
+          latest_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || echo "v0.0.0")
+          current_version="${latest_tag#v}"
           echo "current_version=${current_version}" >> $GITHUB_OUTPUT
-          echo "Current version: ${current_version}"
+          echo "Current version (latest tag): ${current_version}"
 
           release_type="${{ inputs.release_type || 'auto' }}"
 
           if [ "$release_type" = "auto" ]; then
-            # Use semantic-release to determine bump type from commit history.
-            # When no qualifying commits exist, `version --print` prints the
+            # Use semantic-release to determine the next version from the
+            # commit history. When no qualifying commits exist it prints the
             # CURRENT version — require an actual bump before releasing.
-            VERSION=$(semantic-release version --print 2>/dev/null || echo "")
+            # A tool crash is an error, never "no release needed".
+            if ! VERSION=$(semantic-release version --print); then
+              echo "::error::semantic-release failed to compute the next version"
+              exit 1
+            fi
             if [ -n "$VERSION" ] && [ "$VERSION" != "$current_version" ]; then
-              # Determine bump type by comparing versions
-              IFS='.' read -r cur_major cur_minor cur_patch <<< "$current_version"
-              IFS='.' read -r new_major new_minor new_patch <<< "$VERSION"
-              if [ "$new_major" -gt "$cur_major" ]; then
-                bump_type="major"
-              elif [ "$new_minor" -gt "$cur_minor" ]; then
-                bump_type="minor"
-              else
-                bump_type="patch"
-              fi
-              # Use bump_version.py to get the actual new version
-              new_version=$(python scripts/bump_version.py "$bump_type" --dry-run 2>&1 | grep "New version:" | awk '{print $3}')
+              new_version="$VERSION"
               echo "new_version=${new_version}" >> $GITHUB_OUTPUT
               echo "released=true" >> $GITHUB_OUTPUT
-              echo "bump_type=${bump_type}" >> $GITHUB_OUTPUT
-              echo "Auto-detected bump type: ${bump_type}, version: ${new_version}"
+              echo "Auto-detected next version: ${new_version}"
             else
               echo "released=false" >> $GITHUB_OUTPUT
               echo "No release needed (no qualifying commits)"
             fi
           else
-            # Manual bump using bump_version.py
-            new_version=$(python scripts/bump_version.py "$release_type" --dry-run 2>&1 | grep "New version:" | awk '{print $3}')
-            if [ -n "$new_version" ]; then
-              echo "new_version=${new_version}" >> $GITHUB_OUTPUT
-              echo "released=true" >> $GITHUB_OUTPUT
-              echo "bump_type=${release_type}" >> $GITHUB_OUTPUT
-              echo "Manual bump to: ${new_version}"
-            else
-              echo "released=false" >> $GITHUB_OUTPUT
-              echo "Failed to determine new version"
-              exit 1
-            fi
+            # Manual bump computed from the latest tag
+            IFS='.' read -r major minor patch <<< "$current_version"
+            case "$release_type" in
+              major) new_version="$((major + 1)).0.0" ;;
+              minor) new_version="${major}.$((minor + 1)).0" ;;
+              patch) new_version="${major}.${minor}.$((patch + 1))" ;;
+              *) echo "::error::unknown release type ${release_type}"; exit 1 ;;
+            esac
+            echo "new_version=${new_version}" >> $GITHUB_OUTPUT
+            echo "released=true" >> $GITHUB_OUTPUT
+            echo "Manual bump to: ${new_version}"
           fi
 
-      - name: Apply version bump
-        if: steps.determine_version.outputs.released == 'true'
-        run: |
-          bump_type="${{ steps.determine_version.outputs.bump_type }}"
-          python scripts/bump_version.py "$bump_type"
+  lint:
+    name: Lint
+    needs: prepare-release
+    if: needs.prepare-release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Commit and tag version
-        if: steps.determine_version.outputs.released == 'true'
-        run: |
-          new_version="${{ steps.determine_version.outputs.new_version }}"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add -A
-          git diff --cached --quiet && echo "No changes to commit" || \
-            git commit -m "chore(release): ${new_version} [skip ci]"
-          git tag -fa "v${new_version}" -m "Release v${new_version}"
-          git push origin main
-          git push origin "v${new_version}" --force
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff linter
+        run: ruff check tasktree_manager tests
+
+      - name: Run ruff formatter check
+        run: ruff format --check tasktree_manager tests
 
   test:
     name: Test (Python ${{ matrix.python-version }})
@@ -144,12 +145,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        # Same matrix as ci.yml: the release gate must not be weaker than CI
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: "v${{ needs.prepare-release.outputs.new_version }}"
           fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -170,9 +171,47 @@ jobs:
       - name: Run tests
         run: pytest tests/ -v --tb=short
 
+  tag-release:
+    name: Commit and Tag
+    needs: [prepare-release, lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # The exact commit that was tested. Pushing HEAD:main below fails
+          # (non-fast-forward) if main moved in the meantime, instead of
+          # tagging code the gate never saw.
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply version bump
+        # Write the exact version semantic-release computed; deriving it
+        # again from pyproject would drift whenever pyproject and the tag
+        # disagree (phantom or skipped releases)
+        run: python scripts/bump_version.py --set "${{ needs.prepare-release.outputs.new_version }}"
+
+      - name: Commit and tag version
+        run: |
+          new_version="${{ needs.prepare-release.outputs.new_version }}"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add -A
+          git diff --cached --quiet && echo "No changes to commit" || \
+            git commit -m "chore(release): ${new_version} [skip ci]"
+          git tag -a "v${new_version}" -m "Release v${new_version}"
+          git push origin HEAD:main
+          git push origin "v${new_version}"
+
   build:
     name: Build Package
-    needs: [prepare-release, test]
+    needs: [prepare-release, tag-release]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -210,6 +249,9 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [prepare-release, build]
+    # Drafts and pre-releases never reach PyPI: bump_version.py only emits
+    # final X.Y.Z versions, so uploading would publish a real release
+    if: ${{ !inputs.draft && !inputs.pre_release }}
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -231,7 +273,13 @@ jobs:
 
   github-release:
     name: Create GitHub Release
-    needs: [prepare-release, publish-pypi]
+    needs: [prepare-release, build, publish-pypi]
+    # Run after a successful build whether PyPI publishing ran or was
+    # skipped (draft / pre-release), but never after a failed upload
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      (needs.publish-pypi.result == 'success' || needs.publish-pypi.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write
