@@ -5,14 +5,16 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Use tomllib (Python 3.11+) or fall back to tomli
+# tomllib is stdlib from 3.11; tomli (a runtime dependency on 3.10) is the
+# same parser published as a package
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    try:
-        import tomli as tomllib
-    except ImportError:
-        tomllib = None  # type: ignore
+    import tomli as tomllib
+
+
+class ConfigError(ValueError):
+    """The config file exists but cannot be parsed."""
 
 
 # Default keybindings - action name to key mapping
@@ -135,11 +137,20 @@ class Config:
     # Symlink settings - patterns to exclude from symlinking gitignored files
     symlink_blocklist: list[str] = field(default_factory=lambda: list(DEFAULT_SYMLINK_BLOCKLIST))
 
+    # Fields overridden by environment variables for this session, mapped to
+    # the config-file (or default) value they replaced. save() writes these
+    # values back so a one-off `REPOS_DIR=... tasktree-manager` run never
+    # rewrites the user's config file.
+    env_overrides: dict[str, object] = field(default_factory=dict, repr=False, compare=False)
+
     @classmethod
     def load(cls) -> "Config":
         """Load configuration from config file and environment variables.
 
         Priority: Environment variables > Config file > Defaults
+
+        Raises:
+            ConfigError: the config file exists but is not valid TOML.
         """
         config_dir = (
             Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
@@ -178,13 +189,16 @@ class Config:
         # External tools
         tools_config = config_data.get("tools", {})
         editor = tools_config.get("editor", "")
-        lazygit_path = tools_config.get("lazygit_path", "lazygit")
-        hunk_path = tools_config.get("hunk_path", "hunk")
-        claude_path = tools_config.get("claude_path", "claude")
+        # Tool paths are used as argv[0] (no shell), so "~" must be expanded
+        # here; the `c` key goes through a shell and would otherwise be the
+        # only place a "~/.claude/local/claude" path worked
+        lazygit_path = os.path.expanduser(str(tools_config.get("lazygit_path", "lazygit")))
+        hunk_path = os.path.expanduser(str(tools_config.get("hunk_path", "hunk")))
+        claude_path = os.path.expanduser(str(tools_config.get("claude_path", "claude")))
         claude_memory_dir = tools_config.get("claude_memory_dir", "~/.claude/tasktree-memory")
         claude_repo_memory = bool(tools_config.get("claude_repo_memory", True))
-        glab_path = tools_config.get("glab_path", "glab")
-        gh_path = tools_config.get("gh_path", "gh")
+        glab_path = os.path.expanduser(str(tools_config.get("glab_path", "glab")))
+        gh_path = os.path.expanduser(str(tools_config.get("gh_path", "gh")))
 
         # Forge settings
         forge_config = config_data.get("forge", {})
@@ -204,20 +218,34 @@ class Config:
             if action in keybindings and isinstance(key, str):
                 keybindings[action] = key
 
-        # Symlink settings
+        # Symlink settings. The key replaces the defaults wholesale, so it
+        # must be a list of patterns: a scalar would iterate as characters
+        # ("*" blocks everything) and a non-string element crashes fnmatch
         symlink_config = config_data.get("symlinks", {})
         symlink_blocklist = symlink_config.get("blocklist", list(DEFAULT_SYMLINK_BLOCKLIST))
+        if isinstance(symlink_blocklist, list):
+            symlink_blocklist = [p for p in symlink_blocklist if isinstance(p, str)]
+        else:
+            symlink_blocklist = list(DEFAULT_SYMLINK_BLOCKLIST)
 
-        # Environment variables override config file
-        if "REPOS_DIR" in os.environ:
-            repos_dir = Path(os.environ["REPOS_DIR"])
-        if "TASKS_DIR" in os.environ:
-            tasks_dir = Path(os.environ["TASKS_DIR"])
-        if "TASKTREE_THEME" in os.environ:
+        # Environment variables override config file. Empty values are
+        # ignored: Path("") is the current directory, which would silently
+        # turn $PWD into the tasks dir (every subdirectory a deletable task).
+        env_overrides: dict[str, object] = {}
+        if os.environ.get("REPOS_DIR"):
+            env_overrides["repos_dir"] = repos_dir
+            repos_dir = Path(os.environ["REPOS_DIR"]).expanduser()
+        if os.environ.get("TASKS_DIR"):
+            env_overrides["tasks_dir"] = tasks_dir
+            tasks_dir = Path(os.environ["TASKS_DIR"]).expanduser()
+        if os.environ.get("TASKTREE_THEME"):
+            env_overrides["theme"] = theme
             theme = os.environ["TASKTREE_THEME"]
-        if "TASKTREE_DEFAULT_BRANCH" in os.environ:
+        if os.environ.get("TASKTREE_DEFAULT_BRANCH"):
+            env_overrides["default_base_branch"] = default_base_branch
             default_base_branch = os.environ["TASKTREE_DEFAULT_BRANCH"]
-        if "EDITOR" in os.environ and not editor:
+        if os.environ.get("EDITOR") and not editor:
+            env_overrides["editor"] = editor
             editor = os.environ["EDITOR"]
 
         return cls(
@@ -245,57 +273,36 @@ class Config:
             forge_gitlab_hosts=forge_gitlab_hosts,
             keybindings=keybindings,
             symlink_blocklist=symlink_blocklist,
+            env_overrides=env_overrides,
         )
 
     @staticmethod
     def _load_toml(config_file: Path) -> dict:
-        """Load TOML config file.
+        """Load the TOML config file.
 
-        Uses tomllib (Python 3.11+) or tomli, with fallback to manual parsing.
+        A parse error is fatal rather than "no config": treating a typo as
+        an empty file would fall back to ~/repos and ~/tasks, show the setup
+        wizard, and let save() overwrite the user's file with defaults.
         """
-        if tomllib is not None:
-            try:
-                with open(config_file, "rb") as f:
-                    return tomllib.load(f)
-            except Exception:
-                return {}
-
-        # Fallback: simple manual TOML parsing for basic key = "value" format
-        config_data: dict = {}
         try:
-            with open(config_file, "r") as f:
-                current_section = config_data
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("#") or not line:
-                        continue
-                    # Handle sections [section]
-                    if line.startswith("[") and line.endswith("]"):
-                        section_name = line[1:-1].strip()
-                        if section_name not in config_data:
-                            config_data[section_name] = {}
-                        current_section = config_data[section_name]
-                        continue
-                    # Handle key = value
-                    if "=" in line:
-                        key, value = line.split("=", 1)
-                        key = key.strip()
-                        value = value.strip()
-                        # Parse value type
-                        if value.startswith('"') and value.endswith('"'):
-                            value = value[1:-1]
-                        elif value.startswith("'") and value.endswith("'"):
-                            value = value[1:-1]
-                        elif value.lower() == "true":
-                            value = True
-                        elif value.lower() == "false":
-                            value = False
-                        elif value.isdigit():
-                            value = int(value)
-                        current_section[key] = value
-        except Exception:
-            pass
-        return config_data
+            with open(config_file, "rb") as f:
+                data = tomllib.load(f)
+        except tomllib.TOMLDecodeError as e:
+            raise ConfigError(f"Invalid config file {config_file}: {e}") from e
+        except OSError as e:
+            raise ConfigError(f"Cannot read config file {config_file}: {e}") from e
+        if not isinstance(data, dict):
+            raise ConfigError(f"Invalid config file {config_file}: expected a table")
+        return data
+
+    def set_persistent(self, name: str, value: object) -> None:
+        """Set a field and make save() persist it even if the env overrode it."""
+        setattr(self, name, value)
+        self.env_overrides.pop(name, None)
+
+    def _persisted(self, name: str) -> object:
+        """Value save() writes for a field: the pre-env value if overridden."""
+        return self.env_overrides.get(name, getattr(self, name))
 
     @staticmethod
     def _toml_escape(value: str) -> str:
@@ -309,9 +316,25 @@ class Config:
         return "[" + ", ".join(escaped) + "]"
 
     def save(self) -> None:
-        """Save configuration to config file."""
+        """Save configuration to config file.
+
+        Written atomically (temp file + rename) so a crash mid-write cannot
+        leave a truncated file. Raises OSError when the directory or file is
+        not writable; callers decide how to surface that.
+        """
         self.config_dir.mkdir(parents=True, exist_ok=True)
         config_file = self.config_dir / "config.toml"
+
+        # Only pin the blocklist when the user changed it: an explicit copy
+        # of the defaults would freeze them, so hardened defaults added in
+        # later releases (key material patterns) would never reach the user
+        if list(self.symlink_blocklist) == list(DEFAULT_SYMLINK_BLOCKLIST):
+            blocklist_line = (
+                "# Uncomment to replace the built-in defaults (the list replaces, not extends):\n"
+                f"# blocklist = {self._toml_list(self.symlink_blocklist)}"
+            )
+        else:
+            blocklist_line = f"blocklist = {self._toml_list(self.symlink_blocklist)}"
 
         config_content = f'''# tasktree-manager configuration
 # https://github.com/ruslan/tasktree-manager
@@ -321,10 +344,10 @@ class Config:
 # ============================================================================
 
 # Directory containing your git repositories
-repos_dir = "{self._toml_escape(str(self.repos_dir))}"
+repos_dir = "{self._toml_escape(str(self._persisted("repos_dir")))}"
 
 # Directory for task worktrees
-tasks_dir = "{self._toml_escape(str(self.tasks_dir))}"
+tasks_dir = "{self._toml_escape(str(self._persisted("tasks_dir")))}"
 
 # Directory for finished-task diff archives ("" = <tasks_dir>/.archive)
 archive_dir = "{self._toml_escape(self.archive_dir)}"
@@ -336,7 +359,7 @@ archive_dir = "{self._toml_escape(self.archive_dir)}"
 
 # Theme to use (tasktree, tokyo-night, catppuccin-mocha, catppuccin-latte,
 # nord, gruvbox, dracula, monokai, rose-pine, textual-dark, textual-light, ...)
-theme = "{self._toml_escape(self.theme)}"
+theme = "{self._toml_escape(str(self._persisted("theme")))}"
 
 # Show hidden files in file listings
 show_hidden_files = {str(self.show_hidden_files).lower()}
@@ -356,7 +379,7 @@ forge_poll_interval = {self.forge_poll_interval}
 [git]
 
 # Default base branch for new worktrees (main, master, develop, etc.)
-default_base_branch = "{self._toml_escape(self.default_base_branch)}"
+default_base_branch = "{self._toml_escape(str(self._persisted("default_base_branch")))}"
 
 # Automatically push after committing (not recommended for most workflows)
 auto_push = {str(self.auto_push).lower()}
@@ -370,7 +393,7 @@ timeout = {self.git_timeout}
 [tools]
 
 # Preferred editor (leave empty to use $EDITOR)
-editor = "{self._toml_escape(self.editor)}"
+editor = "{self._toml_escape(str(self._persisted("editor")))}"
 
 # Path to lazygit executable
 lazygit_path = "{self._toml_escape(self.lazygit_path)}"
@@ -451,9 +474,11 @@ cursor_up = "{self._toml_escape(self.keybindings.get("cursor_up", "k"))}"
 # When creating worktrees, tasktree-manager symlinks gitignored files from the source repo.
 # This blocklist specifies patterns to exclude from symlinking (e.g., cache files).
 [symlinks]
-blocklist = {self._toml_list(self.symlink_blocklist)}
+{blocklist_line}
 '''
-        config_file.write_text(config_content)
+        tmp_file = config_file.with_name(config_file.name + ".tmp")
+        tmp_file.write_text(config_content)
+        os.replace(tmp_file, config_file)
 
     def is_configured(self) -> bool:
         """Check if configuration is valid and directories exist."""
