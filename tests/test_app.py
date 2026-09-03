@@ -505,8 +505,10 @@ class TestShowDiffAction:
 
         async with app.run_test() as pilot:
             await pilot.pause()
-            # current_task is the freshly created, clean task
+            # current_task is the freshly created, clean task; the diff is
+            # built in a worker, so wait for it before asserting
             app._show_task_diff()
+            await app.workers.wait_for_complete()
             await pilot.pause()
 
             assert app.is_running

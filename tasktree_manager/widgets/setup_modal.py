@@ -30,6 +30,8 @@ class SetupModal(ModalScreen[tuple[Path, Path] | None]):
     SetupModal > Container {
         width: 80;
         height: auto;
+        max-height: 100%;
+        overflow-y: auto;
         border: round $border;
         background: $panel;
         padding: 1 2;
@@ -87,41 +89,30 @@ class SetupModal(ModalScreen[tuple[Path, Path] | None]):
     }
     """
 
-    WELCOME_TEXT = """Welcome to tasktree-manager!
+    # Kept short so the whole wizard (two inputs + buttons) fits an 80x24
+    # terminal; the container scrolls if it still does not
+    WELCOME_TEXT = (
+        "Welcome! Pick where your git repositories live (REPOS_DIR) and where "
+        "task worktrees go (TASKS_DIR). Saved to ~/.config/tasktree-manager/config.toml."
+    )
 
-Before you start, please configure the following directories:
-
-1. REPOS_DIR: Where your git repositories are located
-2. TASKS_DIR: Where task worktrees will be created
-
-These settings will be saved to ~/.config/tasktree-manager/config.toml
-"""
-
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, error_message: str = "", **kwargs):
         super().__init__(*args, **kwargs)
-        self.error_message = ""
+        self.error_message = error_message
 
     def compose(self) -> ComposeResult:
         with Container():
             yield Label("tasktree-manager Setup", classes="modal-title")
             yield Static(self.WELCOME_TEXT, classes="welcome-text")
 
-            yield Label("Repositories Directory:", classes="section-label")
-            yield Static(
-                "Directory containing your git repositories (e.g., ~/repos, ~/code)",
-                classes="help-text",
-            )
+            yield Label("Repositories Directory (e.g., ~/repos):", classes="section-label")
             yield Input(
                 placeholder="e.g., /Users/username/repos",
                 value=str(Path.home() / "repos"),
                 id="repos-dir",
             )
 
-            yield Label("Tasks Directory:", classes="section-label")
-            yield Static(
-                "Directory where task worktrees will be created (e.g., ~/tasks)",
-                classes="help-text",
-            )
+            yield Label("Tasks Directory (e.g., ~/tasks):", classes="section-label")
             yield Input(
                 placeholder="e.g., /Users/username/tasks",
                 value=str(Path.home() / "tasks"),
@@ -158,8 +149,23 @@ These settings will be saved to ~/.config/tasktree-manager/config.toml
         elif not repos_dir.is_dir():
             errors.append(f"Repositories path is not a directory: {repos_dir}")
 
+        if not repos_input.value.strip() or not tasks_input.value.strip():
+            errors.append("Both directories are required")
         if not tasks_dir.parent.exists():
             errors.append(f"Parent directory does not exist: {tasks_dir.parent}")
+        elif tasks_dir.exists() and not tasks_dir.is_dir():
+            # Saving this would make every later launch crash in ensure_dirs()
+            errors.append(f"Tasks path is not a directory: {tasks_dir}")
+
+        # The task list treats every subdirectory of tasks_dir as a deletable
+        # task, so the repos must never live inside it (or be it)
+        repos_resolved, tasks_resolved = repos_dir.resolve(), tasks_dir.resolve()
+        if (
+            repos_resolved == tasks_resolved
+            or repos_resolved.is_relative_to(tasks_resolved)
+            or tasks_resolved.is_relative_to(repos_resolved)
+        ):
+            errors.append("Repositories and tasks directories must be separate (not nested)")
 
         if errors:
             self.error_message = "\n".join(errors)

@@ -2,7 +2,7 @@
 
 from typing import TYPE_CHECKING
 
-from rich.markup import escape
+from textual.content import Content
 from textual.message import Message
 from textual.widgets import OptionList
 from textual.widgets.option_list import Option, OptionDoesNotExist
@@ -12,23 +12,23 @@ from ..services.models import Worktree
 if TYPE_CHECKING:
     from ..services.forge import ForgeStatus
 
-# One-cell badges (single-cell BMP glyphs only — emoji break Rich cell-width
-# math). Session vocabulary matches the TaskList hook indicators; ▣ avoids
-# colliding with the git-clean ✓.
+# One-cell badges as (glyph, style) pairs (single-cell BMP glyphs only —
+# emoji break Rich cell-width math). Session vocabulary matches the TaskList
+# hook indicators; ▣ avoids colliding with the git-clean ✓.
 SESSION_BADGES = {
-    "working": "[magenta]⟳[/]",
-    "needs_input": "[yellow]![/]",
-    "ready": "[green]▣[/]",
+    "working": ("⟳", "magenta"),
+    "needs_input": ("!", "yellow"),
+    "ready": ("▣", "green"),
 }
 MR_BADGES = {
-    "open": "[green]○[/]",
-    "merged": "[magenta]●[/]",
-    "closed": "[red]×[/]",
+    "open": ("○", "green"),
+    "merged": ("●", "magenta"),
+    "closed": ("×", "red"),
 }
 CI_BADGES = {
-    "running": "[yellow]◐[/]",
-    "success": "[green]✔[/]",
-    "failed": "[red]✘[/]",
+    "running": ("◐", "yellow"),
+    "success": ("✔", "green"),
+    "failed": ("✘", "red"),
 }
 
 
@@ -106,6 +106,9 @@ class WorktreeList(OptionList):
         self.clear_options()
 
         if not worktrees:
+            # Tell listeners the previous selection is gone; otherwise the
+            # app keeps acting on a worktree that belongs to another task
+            self._emit_highlighted()
             return
 
         # Calculate column widths for alignment
@@ -124,19 +127,19 @@ class WorktreeList(OptionList):
                     # Use option ID to find the correct index
                     idx = self.get_option_index(preserve_selection)
 
-                    # Defer highlight setting to next event loop cycle
+                    # Defer highlight setting to next event loop cycle.
+                    # Setting `highlighted` fires OptionHighlighted, whose
+                    # handler emits WorktreeHighlighted exactly once.
                     def set_highlight():
                         self.highlighted = idx
                         self.scroll_to_highlight()
-                        self._emit_highlighted()
 
                     self.call_later(set_highlight)
-                    return  # Don't emit here, will be done in callback
+                    return
                 except OptionDoesNotExist:
                     self.action_first()
             else:
                 self.action_first()
-            self._emit_highlighted()
 
     def _load_flat_worktrees(self, worktrees: list[Worktree]) -> None:
         """Load worktrees without grouping."""
@@ -170,15 +173,16 @@ class WorktreeList(OptionList):
                 self._option_to_worktree[option_idx] = orig_idx
                 self._add_worktree_option(worktree)
 
-    def _build_prompt(self, worktree: Worktree) -> str:
-        """Compose one worktree row with badge cells and aligned columns."""
+    def _build_prompt(self, worktree: Worktree) -> Content:
+        """Compose one worktree row with badge cells and aligned columns.
+
+        Built as Content rather than a markup string: git allows brackets in
+        branch names, and Textual's markup parser would consume them.
+        """
         branch = worktree.branch or "unknown"
-        # Pad first, then escape: git allows markup-significant brackets in
-        # branch names, and escaping adds characters that would skew padding
-        name_col = escape(f"{worktree.name:<{self._max_name_len}}")
-        branch_padded = escape(f"{branch:<{self._max_branch_len}}")
-        branch_col = f"[dim]{branch_padded}[/]"
-        claude_indicator = "[blue]◆[/]" if worktree.has_claude_md else " "
+        name_col = f"{worktree.name:<{self._max_name_len}}"
+        branch_col = (f"{branch:<{self._max_branch_len}}", "dim")
+        claude_indicator = ("◆", "blue") if worktree.has_claude_md else " "
 
         path_key = str(worktree.path)
         session = SESSION_BADGES.get(self._session_states.get(path_key, ""), " ")
@@ -187,10 +191,22 @@ class WorktreeList(OptionList):
         ci = CI_BADGES.get(forge_status.ci_state, " ") if forge_status else " "
 
         if worktree.is_dirty:
-            git_status = f"[red]✗ {worktree.changed_files} files[/]"
+            git_status = (f"✗ {worktree.changed_files} files", "red")
         else:
-            git_status = "[green]✓[/]"
-        return f" {session}{claude_indicator}{name_col}  {branch_col}  {mr}{ci}  {git_status}"
+            git_status = ("✓", "green")
+        return Content.assemble(
+            " ",
+            session,
+            claude_indicator,
+            name_col,
+            "  ",
+            branch_col,
+            "  ",
+            mr,
+            ci,
+            "  ",
+            git_status,
+        )
 
     def _add_worktree_option(self, worktree: Worktree) -> None:
         """Add a single worktree option to the list."""

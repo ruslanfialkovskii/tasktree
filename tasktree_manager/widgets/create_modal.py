@@ -191,7 +191,7 @@ class CreateTaskModal(RepoFilterMixin, ThemedModalScreen[tuple[str, list[str], s
         available_repos: list[str],
         *args,
         initial_repos: list[str] | None = None,
-        initial_base_branch: str = "master",
+        initial_base_branch: str = "main",
         title: str = "Create New Task",
         **kwargs,
     ):
@@ -208,7 +208,11 @@ class CreateTaskModal(RepoFilterMixin, ThemedModalScreen[tuple[str, list[str], s
             yield Label("Task Name:", classes="section-label")
             yield Input(placeholder="e.g., FEAT-123-new-feature", id="task-name")
             yield Label("Base Branch:", classes="section-label")
-            yield Input(value=self.initial_base_branch, placeholder="master", id="base-branch")
+            yield Input(
+                value=self.initial_base_branch,
+                placeholder=self.initial_base_branch,
+                id="base-branch",
+            )
             yield Label("Search Repositories:", classes="section-label")
             yield Input(placeholder="Type to filter (e.g., ansible, postgres)...", id="repo-search")
             yield Label("Select Repositories:", classes="section-label")
@@ -236,7 +240,7 @@ class CreateTaskModal(RepoFilterMixin, ThemedModalScreen[tuple[str, list[str], s
         branch_input = self.query_one("#base-branch", Input)
 
         name = name_input.value.strip()
-        base_branch = branch_input.value.strip() or "master"
+        base_branch = branch_input.value.strip() or self.initial_base_branch
         selected_repos = list(self.selected_repos)
 
         # Same validation the TaskManager enforces, surfaced early in the UI
@@ -258,10 +262,18 @@ class AddRepoModal(RepoFilterMixin, ThemedModalScreen[tuple[list[str], str] | No
     Dismisses with: (repos, branch) tuple or None if cancelled.
     """
 
-    def __init__(self, task_name: str, available_repos: list[str], *args, **kwargs):
+    def __init__(
+        self,
+        task_name: str,
+        available_repos: list[str],
+        *args,
+        initial_base_branch: str = "main",
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.task_name = task_name
         self.available_repos = available_repos
+        self.initial_base_branch = initial_base_branch
         self.selected_repos: set[str] = set()
         self._reset_visible_repos()
 
@@ -269,7 +281,11 @@ class AddRepoModal(RepoFilterMixin, ThemedModalScreen[tuple[list[str], str] | No
         with Container():
             yield Label(escape(f"Add Repos to: {self.task_name}"), classes="modal-title")
             yield Label("Base Branch:", classes="section-label")
-            yield Input(value="master", placeholder="master", id="base-branch")
+            yield Input(
+                value=self.initial_base_branch,
+                placeholder=self.initial_base_branch,
+                id="base-branch",
+            )
             if self.available_repos:
                 yield Label("Search Repositories:", classes="section-label")
                 yield Input(
@@ -301,7 +317,7 @@ class AddRepoModal(RepoFilterMixin, ThemedModalScreen[tuple[list[str], str] | No
 
         branch_input = self.query_one("#base-branch", Input)
 
-        base_branch = branch_input.value.strip() or "master"
+        base_branch = branch_input.value.strip() or self.initial_base_branch
         selected_repos = list(self.selected_repos)
 
         error = validate_branch_name(base_branch)

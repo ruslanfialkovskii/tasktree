@@ -2,7 +2,7 @@
 
 from enum import Enum, auto
 
-from rich.markup import escape
+from textual.content import Content
 from textual.message import Message
 from textual.widgets import OptionList
 from textual.widgets.option_list import Option, OptionDoesNotExist
@@ -78,25 +78,25 @@ class TaskList(OptionList):
         self.highlighted = value
 
     def _format_task_option(self, task: Task, claude_status: str | None = None) -> Option:
-        """Format a task as an Option for display."""
-        claude_md = "[blue]◆[/]" if task.has_claude_md else " "
-        if claude_status == "running":
-            hook_indicator = " [magenta]⟳[/]"
-        elif claude_status == "waiting":
-            hook_indicator = " [yellow]![/]"
-        elif claude_status == "ended":
-            hook_indicator = " [green]✓[/]"
-        else:
-            hook_indicator = ""
-        # Escape the label: task directories (and aliases) can hold
-        # markup-significant brackets which must not style (or crash)
-        # the list rendering
-        name = escape(task.display_label)
+        """Format a task as an Option for display.
+
+        The prompt is assembled as Content, not a markup string: task
+        directory names and aliases may contain brackets ("[WIP] fix"),
+        which Textual's markup parser would consume as style tags.
+        """
+        parts: list[str | tuple[str, str]] = []
+        parts.append(("●", "red") if task.is_dirty else "  ")
+        parts.append(("◆", "blue") if task.has_claude_md else " ")
+        parts.append(task.display_label)
         if task.is_dirty:
-            prompt = f"[red]●[/]{claude_md}{name} [red]({task.dirty_count})[/]{hook_indicator}"
-        else:
-            prompt = f"  {claude_md}{name}{hook_indicator}"
-        return Option(prompt, id=task.name)
+            parts.append((f" ({task.dirty_count})", "red"))
+        if claude_status == "running":
+            parts.append((" ⟳", "magenta"))
+        elif claude_status == "waiting":
+            parts.append((" !", "yellow"))
+        elif claude_status == "ended":
+            parts.append((" ✓", "green"))
+        return Option(Content.assemble(*parts), id=task.name)
 
     def load_tasks(
         self,
@@ -126,19 +126,19 @@ class TaskList(OptionList):
                     # Use option ID to find the correct index
                     idx = self.get_option_index(preserve_selection)
 
-                    # Defer highlight setting to next event loop cycle
+                    # Defer highlight setting to next event loop cycle.
+                    # Setting `highlighted` fires OptionHighlighted, whose
+                    # handler emits TaskHighlighted exactly once.
                     def set_highlight():
                         self.highlighted = idx
                         self.scroll_to_highlight()
-                        self._emit_highlighted()
 
                     self.call_later(set_highlight)
-                    return  # Don't emit here, will be done in callback
+                    return
                 except OptionDoesNotExist:
                     self.action_first()
             else:
                 self.action_first()
-            self._emit_highlighted()
 
     def _emit_highlighted(self) -> None:
         """Emit a TaskHighlighted message for the current item."""
