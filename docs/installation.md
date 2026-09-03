@@ -256,7 +256,10 @@ Launch tasktree-manager:
 tasktree-manager
 ```
 
-On first run, you'll see a configuration wizard:
+On first run, you'll see a configuration wizard (it appears when the repositories
+directory, `~/repos` by default, does not exist yet; with `~/repos` already present
+the defaults apply and no `config.toml` is written until you change a setting, such
+as the theme):
 
 #### Configuration Wizard
 

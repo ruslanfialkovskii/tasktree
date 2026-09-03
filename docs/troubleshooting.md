@@ -692,34 +692,33 @@ wsl --shutdown
 
 ## Git-Specific Issues
 
-### "Branch already exists"
+### Task branch already exists
 
-**Error:**
+Creating a task whose branch already exists in a repo (left behind by an earlier
+task, or created by hand) is not an error: the worktree is created **on the existing
+branch as-is**, keeping every commit on it. The base branch you enter is ignored for
+that repo.
+
+**Error you can still hit:**
 ```
-fatal: A branch named 'FEAT-123' already exists
+fatal: 'FEAT-123' is already checked out at '/Users/you/repos/repo-name'
 ```
 
-**Cause:** Branch exists in repository from previous task.
+**Cause:** the branch is checked out in the main repository (or another worktree);
+git allows a branch in only one worktree at a time.
 
-**Solutions:**
+**Solution:**
+```bash
+cd ~/repos/repo-name
+git switch main            # move the main checkout off the task branch
+# then retry the task creation / add-repo
+```
 
-1. **Use different task name:**
-   ```bash
-   # Instead of FEAT-123, use FEAT-123-v2
-   ```
-
-2. **Delete old branch:**
-   ```bash
-   cd ~/repos/repo-name
-   git branch -d FEAT-123  # If merged
-   git branch -D FEAT-123  # Force delete
-   ```
-
-3. **Use existing branch:**
-   ```bash
-   # When creating task, use existing branch as base
-   Base branch: FEAT-123
-   ```
+To start the task fresh from the base branch instead, delete the old branch first:
+```bash
+git branch -d FEAT-123  # If merged
+git branch -D FEAT-123  # Force delete (loses its unmerged commits)
+```
 
 ### "Detached HEAD state"
 
@@ -921,10 +920,11 @@ Yes! Each task creates its own worktree and branch:
 ### What happens to branches when I delete a task?
 
 - Worktrees are removed from `TASKS_DIR`
-- Local branches remain in main repository
+- The local task branch is deleted from the main repository (`git branch -D`);
+  the remaining diff is archived under `archive_dir` first
 - Remote branches remain on GitHub/GitLab (if pushed)
 
-**Manual cleanup:**
+**Manual cleanup (only for branches created outside tasktree):**
 ```bash
 cd ~/repos/repo-name
 git branch -d FEAT-123  # Delete local branch

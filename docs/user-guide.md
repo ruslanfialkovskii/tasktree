@@ -310,10 +310,10 @@ what is displayed. Press `?` for the full reference at any time.
 5. Select repos with `Space` (can select multiple)
 6. Tab to "Create" button, press `Enter`
 
-Task names may contain letters, numbers, `.`, `_`, `/` and `-`. Because the
-name becomes a directory under your tasks dir (and a git branch), names with
-`.`/`..` path segments, empty segments, or a leading `-` are rejected; base
-branch names must not start with `-` either.
+Task names may contain letters, numbers, `.`, `_` and `-`. The name becomes a
+single directory under your tasks dir (and a git branch), so `/`, `.`, `..` and a
+leading `-` are rejected; base branch names must be plain branch names too (no
+leading `-`/`+`, no `:` refspecs, none of the characters git forbids in refs).
 
 **Clone task workflow:**
 Useful when you're spinning up several similar tasks that share the same set of repos.
@@ -648,6 +648,14 @@ d (delete task)
    - **Uncommitted changes**: Commit or stash first
    - **Unpushed commits**: Push or force delete
    - **Unmerged branches**: Merge PR or force delete
+   - **Wrong branch checked out**: a worktree that is detached or on another branch
+     is reported as an error — switch back to the task branch (the check and the
+     archive follow the task branch, because that is what deletion removes)
+
+**Delete a single worktree:**
+1. Highlight the worktree in the right panel
+2. Press `D` — the same safety check, dialog (Push / Open Lazygit / Force Delete)
+   and diff archive apply, scoped to that one repo
 
 **Safety features:**
 - tasktree-manager checks for uncommitted changes
@@ -664,7 +672,9 @@ d (delete task)
 - ✅ Worktrees removed from `TASKS_DIR`
 - ✅ Branches remain on remote (if pushed)
 - ✅ Original repos in `REPOS_DIR` untouched
-- ❌ Local branches remain in original repos (cleanup manually if needed)
+- ❌ The local task branch is deleted from each repo (`git branch -D`) — unpushed
+  commits survive only in the archive patch, which is why the safety check blocks
+  unpushed work and why a worktree must be on its task branch to count as safe
 
 **From scripts:** `tasktree-manager finish <task>` runs the same guided flow headlessly
 (safety sweep → optional `--push` → archive → delete), and `tasktree-manager status
@@ -752,9 +762,9 @@ npm i -g hunkdiff
 
 **Direct editor integration:**
 1. Highlight task or worktree
-2. Press `e` to open your configured editor
-3. tasktree-manager suspends while editor runs
-4. Selection is preserved when you return
+2. Press `e` to open your configured editor in a new Ghostty tab (`$EDITOR .`)
+3. tasktree-manager keeps running alongside the editor (macOS + Ghostty only, see
+   Limitations)
 
 **Configure your editor** in `~/.config/tasktree-manager/config.toml`:
 ```toml

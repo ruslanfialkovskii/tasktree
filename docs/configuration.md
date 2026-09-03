@@ -165,6 +165,9 @@ claude_path = "claude"
 # task's .claude/settings.local.json so every task session reads and writes one
 # shared memory pool that persists across tasks.
 # Set to "" to disable (each task keeps its own throwaway memory).
+# If you relocated Claude Code's config home with $CLAUDE_CONFIG_DIR, point
+# this under that directory too (the per-repo worktree memory below and
+# session resume already honour the variable).
 # Default: "~/.claude/tasktree-memory"
 claude_memory_dir = "~/.claude/tasktree-memory"
 
@@ -547,7 +550,10 @@ blocklist = [
 > **Upgrading note:** if your existing `config.toml` already contains a
 > `blocklist`, it keeps overriding the defaults — the key-material patterns
 > added in newer versions do NOT apply until you add them (or delete the
-> `blocklist` line to inherit the defaults).
+> `blocklist` line to inherit the defaults). Saving the config from the app
+> (for example on a theme switch) no longer writes the default list: the key
+> is only written when you customised it, so the built-in defaults keep
+> applying as they evolve.
 
 ### Common Use Cases
 
@@ -687,9 +693,13 @@ Override configuration for a single session using environment variables:
 | `TASKS_DIR`               | `tasks_dir`            | `export TASKS_DIR=~/worktrees`   |
 | `TASKTREE_THEME`          | `ui.theme`             | `export TASKTREE_THEME=nord`     |
 | `TASKTREE_DEFAULT_BRANCH` | `git.default_base_branch` | `export TASKTREE_DEFAULT_BRANCH=develop` |
-| `EDITOR`                  | `tools.editor`         | `export EDITOR=nvim`             |
-| `SHELL`                   | `tools.shell`          | `export SHELL=/bin/zsh`          |
+| `EDITOR`                  | `tools.editor` (fallback: used only when `tools.editor` is empty) | `export EDITOR=nvim` |
 | `XDG_CONFIG_HOME`         | (config location)      | `export XDG_CONFIG_HOME=~/.cfg`  |
+
+Environment overrides apply to the running session only: saving the config (for
+example by switching themes with `t`) writes the config-file values back, never the
+overridden ones. Empty values (`TASKS_DIR=`) are ignored. A config file that fails to
+parse is an error at startup, not an empty config.
 
 ### Usage Examples
 

@@ -82,7 +82,7 @@ tasktree-manager repos           # available repos in REPOS_DIR
 tasktree-manager add-repo DIC-1901-argocd-tls infra
 tasktree-manager status                       # current task inferred from $PWD; also --json / --oneline / --forge
 tasktree-manager finish DIC-1901-argocd-tls   # safety sweep -> archive diff -> delete; --push / --no-archive / --force
-tasktree-manager delete DIC-1901-argocd-tls   # low-level delete; refuses on unfinished work; --force overrides
+tasktree-manager delete DIC-1901-argocd-tls   # archive diff -> delete; refuses on unfinished work; --force overrides
 ```
 
 Exit code is 0 on success, 1 on failure with the reason on stderr. `delete` and `finish` run
@@ -173,7 +173,9 @@ Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 - Python 3.10+ (3.13+ recommended)
 - Git 2.0+
 - 256-color terminal
-- Unix-like OS (macOS, Linux, WSL2)
+- Unix-like OS (macOS, Linux, WSL2). Opening a folder, editor or Claude session in a
+  new terminal tab (`o`, `e`, `c`) drives Ghostty via AppleScript and is macOS-only;
+  elsewhere those keys show a notice
 
 See [Installation Guide](docs/installation.md) for detailed requirements and setup.
 

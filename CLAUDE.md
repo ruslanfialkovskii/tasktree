@@ -45,7 +45,9 @@ pytest tests/test_app.py::TestTaskTreeApp::test_app_starts -v
 `tasktree-manager` with any argument routes to the CLI instead of the TUI (dispatch in
 `app.py:main`). Subcommands `create`/`list`/`delete`/`add-repo`/`repos` are thin wrappers over
 the services layer for scripts and AI agents (the `/wtask` skill drives them). `delete` enforces
-the same `check_task_safety` gate as the TUI unless `--force`.
+the same `check_task_safety` gate as the TUI unless `--force`, and always archives the remaining
+diff first. Task names are a single path segment (no `/`); `get_task` validates names because
+its result is rmtree'd.
 
 ### Theming
 
